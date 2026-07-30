@@ -28,7 +28,7 @@ params.cnvkit_exec = "cnvkit.py"
 // Reference / support files
 // ---------------------------------------------------------------------------
 ref_fasta     = file(params.ref)
-ref_index_ch  = Channel.fromPath("${params.ref}.*")            // bwa-meme index files (.bwt/.ann/.amb/.pac/etc)
+ref_index_ch  = Channel.fromPath("${params.ref}.*").collect()  // bwa-meme index files
 gtf_file      = file(params.gtf)
 intervals_file = file(params.intervals)
 
@@ -54,8 +54,7 @@ process FASTP {
     tuple val(sample), path(r1), path(r2)
 
     output:
-    tuple val(sample), path("${sample}_merged.fastq"), emit: merged
-    tuple val(sample), path("${sample}_unmerged_R1.fastq"), path("${sample}_unmerged_R2.fastq"), emit: unmerged
+    tuple val(sample), path("${sample}_merged.fastq"), path("${sample}_unmerged_R1.fastq"), path("${sample}_unmerged_R2.fastq"), emit: all_reads
     path "${sample}_singleton_R1.fastq"
     path "${sample}_singleton_R2.fastq"
     path "${sample}_fastp.html"
@@ -194,10 +193,16 @@ process HAPLOTYPE_CALLER {
     path ref_idx
 
     output:
-    tuple val(sample), path("${sample}.g.vcf.gz"), path("${sample}.g.vcf.gz.tbi"), emit: gvcf
+    tuple path("${sample}.g.vcf.gz"), path("${sample}.g.vcf.gz.tbi"), emit: gvcf
 
     script:
     """
+    # Create required fasta dictionary index if missing
+    if [ ! -f \$(basename ${ref} .fna).dict ] && [ ! -f \$(basename ${ref} .fasta).dict ]; then
+        picard CreateSequenceDictionary R=${ref}
+    fi
+    samtools faidx ${ref} 2>/dev/null || true
+
     gatk HaplotypeCaller \
       -R "${ref}" \
       -I "${dedup_bam}" \
@@ -241,180 +246,56 @@ process GENOTYPE_GVCFS {
     path ref_idx
 
     output:
-    path "cohort_raw_variants.vcf.gz", emit: raw_vcf
-    path "cohort_raw_variants.vcf.gz.tbi"
+    path "raw_variants.vcf.gz", emit: raw_vcf
 
     script:
     """
-    gatk --java-options "-Xmx12G" GenotypeGVCFs -R "${ref}" \
-        -V "gendb://${genomicsdb}" -O "cohort_raw_variants.vcf.gz"
+    gatk GenotypeGVCFs \
+        -R ${ref} \
+        -V gendb://${genomicsdb} \
+        -O raw_variants.vcf.gz
     """
 }
 
-process VARIANT_FILTRATION {
+process HARD_FILTER_VARIANTS {
     publishDir "${params.outdir}/06_filtered_variants", mode: 'copy'
 
     input:
     path raw_vcf
-    path raw_vcf_tbi
     path ref
     path ref_idx
 
     output:
-    path "cohort_filtered_variants.vcf.gz", emit: filtered_vcf
-    path "cohort_filtered_variants.vcf.gz.tbi"
+    path "filtered_snps.vcf.gz"
+    path "filtered_indels.vcf.gz"
 
     script:
     """
-    gatk --java-options "-Xmx12G" VariantFiltration \
-        -R "${ref}" \
-        -V "${raw_vcf}" \
-        -filter "QD < 2.0 || QUAL < 30.0 || SOR > 3.0 || FS > 60.0 || MQ < 40.0" \
-        --filter-name "CLINICAL_HARD_FILTER" \
-        -O "cohort_filtered_variants.vcf.gz"
-    """
-}
+    # Extract & filter SNPs
+    gatk SelectVariants -R ${ref} -V ${raw_vcf} -select-type SNP -O raw_snps.vcf.gz
+    gatk VariantFiltration -R ${ref} -V raw_snps.vcf.gz \
+        -filter "QD < 2.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0" \
+        --filter-name "snp_hard_filter" -O filtered_snps.vcf.gz
 
-process SELECT_VARIANTS {
-    publishDir "${params.outdir}/06_filtered_variants/population_qc", mode: 'copy'
-
-    input:
-    path filtered_vcf
-    path filtered_vcf_tbi
-    path ref
-    path ref_idx
-
-    output:
-    path "cohort_clean_pass_snps.vcf.gz", emit: clean_snps
-
-    script:
-    """
-    gatk --java-options "-Xmx12G" SelectVariants -R "${ref}" \
-        -V "${filtered_vcf}" \
-        -select-type SNP --exclude-filtered true \
-        -O "cohort_clean_pass_snps.vcf.gz"
-    """
-}
-
-process BCFTOOLS_STATS {
-    publishDir "${params.outdir}/06_filtered_variants/population_qc", mode: 'copy'
-
-    input:
-    path clean_snps
-
-    output:
-    path "bcftools_summary.stats"
-
-    script:
-    """
-    bcftools stats "${clean_snps}" > "bcftools_summary.stats"
+    # Extract & filter Indels
+    gatk SelectVariants -R ${ref} -V ${raw_vcf} -select-type INDEL -O raw_indels.vcf.gz
+    gatk VariantFiltration -R ${ref} -V raw_indels.vcf.gz \
+        -filter "QD < 2.0 || FS > 200.0 || ReadPosRankSum < -20.0" \
+        --filter-name "indel_hard_filter" -O filtered_indels.vcf.gz
     """
 }
 
 // ---------------------------------------------------------------------------
 // STAGE 5: Control-Free Copy Number Profiling (CNVkit)
 // ---------------------------------------------------------------------------
-process CNVKIT_BATCH {
-    publishDir "${params.outdir}/07_cnvkit_results/sample_outputs", mode: 'copy'
+process CNVKIT_PROFILE {
+    tag "${sample}"
+    publishDir "${params.outdir}/07_cnvkit_output/${sample}", mode: 'copy'
 
     input:
-    path dedup_bams
-    path dedup_bais
+    tuple val(sample), path(dedup_bam), path(dedup_bai)
     path ref
     path gtf
 
     output:
-    path "*_dedup.cns", emit: cns_files
-    path "*_dedup.cnr", emit: cnr_files
-
-    script:
-    """
-    ${params.cnvkit_exec} batch ${dedup_bams} \
-        --normal \
-        -m wgs \
-        --fasta "${ref}" \
-        --annotate "${gtf}" \
-        --output-dir . \
-        -p ${task.cpus}
-    """
-}
-
-process CNVKIT_CALL_SCATTER {
-    tag "${sample}"
-
-    publishDir "${params.outdir}/07_cnvkit_results/sample_outputs", mode: 'copy', pattern: "*_absolute_calls.cns"
-    publishDir "${params.outdir}/07_cnvkit_results/visual_plots", mode: 'copy', pattern: "*_genome_scatter.png"
-
-    input:
-    tuple val(sample), path(cns_file), path(cnr_file)
-
-    output:
-    path "${sample}_absolute_calls.cns"
-    path "${sample}_genome_scatter.png"
-
-    script:
-    """
-    ${params.cnvkit_exec} call "${cns_file}" \
-        -o "${sample}_absolute_calls.cns"
-
-    ${params.cnvkit_exec} scatter "${cnr_file}" \
-        -s "${cns_file}" \
-        -o "${sample}_genome_scatter.png"
-    """
-}
-
-// ---------------------------------------------------------------------------
-// WORKFLOW
-// ---------------------------------------------------------------------------
-workflow {
-
-    // --- Stage 1 input: pair up *_R1_001.fastq / *_R2_001.fastq -----------
-    read_pairs_ch = Channel
-        .fromFilePairs("${params.reads}/*_R{1,2}_001.fastq", flat: true)
-        .map { sample, r1, r2 -> tuple(sample, r1, r2) }
-
-    FASTP(read_pairs_ch)
-
-    // --- Stage 2: map merged + unmerged fractions --------------------------
-    mapping_input_ch = FASTP.out.merged.join(FASTP.out.unmerged)
-    BWA_MEME_MAP(mapping_input_ch, ref_fasta, ref_index_ch.collect())
-
-    // --- Stage 3: exclude failed control batch, then dedup + QC ----------
-    valid_bams_ch = BWA_MEME_MAP.out.bam
-        .filter { sample, bam -> !(sample =~ /${params.exclude}/) }
-
-    MARK_DUPLICATES(valid_bams_ch)
-    QC_METRICS(MARK_DUPLICATES.out.dedup_bam)
-
-    // --- Stage 4: joint genotyping & hard filtering ------------------------
-    HAPLOTYPE_CALLER(MARK_DUPLICATES.out.dedup_bam, ref_fasta, ref_index_ch.collect())
-
-    gvcf_files_ch = HAPLOTYPE_CALLER.out.gvcf.map { sample, gvcf, tbi -> gvcf }.collect()
-    tbi_files_ch  = HAPLOTYPE_CALLER.out.gvcf.map { sample, gvcf, tbi -> tbi }.collect()
-
-    GENOMICSDB_IMPORT(gvcf_files_ch, tbi_files_ch, intervals_file, ref_fasta, ref_index_ch.collect())
-    GENOTYPE_GVCFS(GENOMICSDB_IMPORT.out.genomicsdb, ref_fasta, ref_index_ch.collect())
-    VARIANT_FILTRATION(GENOTYPE_GVCFS.out.raw_vcf, GENOTYPE_GVCFS.out.raw_vcf_tbi, ref_fasta, ref_index_ch.collect())
-    SELECT_VARIANTS(VARIANT_FILTRATION.out.filtered_vcf, VARIANT_FILTRATION.out.filtered_vcf_tbi, ref_fasta, ref_index_ch.collect())
-    BCFTOOLS_STATS(SELECT_VARIANTS.out.clean_snps)
-
-    // --- Stage 5: control-free copy number profiling -----------------------
-    all_dedup_bams_ch = MARK_DUPLICATES.out.dedup_bam.map { sample, bam, bai -> bam }.collect()
-    all_dedup_bais_ch = MARK_DUPLICATES.out.dedup_bam.map { sample, bam, bai -> bai }.collect()
-
-    CNVKIT_BATCH(all_dedup_bams_ch, all_dedup_bais_ch, ref_fasta, gtf_file)
-
-    cns_ch = CNVKIT_BATCH.out.cns_files.flatten()
-        .map { f -> tuple(f.baseName.replaceAll(/_dedup$/, ''), f) }
-    cnr_ch = CNVKIT_BATCH.out.cnr_files.flatten()
-        .map { f -> tuple(f.baseName.replaceAll(/_dedup$/, ''), f) }
-
-    cnvkit_pairs_ch = cns_ch.join(cnr_ch)
-    CNVKIT_CALL_SCATTER(cnvkit_pairs_ch)
-}
-
-workflow.onComplete {
-    log.info "=========================================================="
-    log.info "PIPELINE ${ workflow.success ? 'SUCCESS' : 'FAILED' }"
-    log.info "=========================================================="
-}
+    path "${sample}.cns"
